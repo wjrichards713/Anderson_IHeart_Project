@@ -12,19 +12,33 @@ import json
 import os
 import sys
 from collections import deque
+from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def get_config_path():
-    """Return config file path next to the executable (or script)."""
+def get_base_path():
+    """Return directory next to the executable (or script)."""
     if getattr(sys, 'frozen', False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, "bridge_config.json")
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_config_path():
+    return os.path.join(get_base_path(), "bridge_config.json")
+
+
+def get_log_path():
+    log_dir = os.path.join(get_base_path(), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    return os.path.join(log_dir, f"bridge_{stamp}.log")
+
+
+def timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 def encode_special(display_string):
@@ -47,6 +61,28 @@ def encode_special(display_string):
         result.append(ord(display_string[i]))
         i += 1
     return bytes(result)
+
+
+# ---------------------------------------------------------------------------
+# File Logger
+# ---------------------------------------------------------------------------
+
+class FileLogger:
+    """Appends timestamped lines to a daily log file."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._path = get_log_path()
+        # Write a session header
+        self.write("========== Session started ==========")
+
+    def write(self, line):
+        with self._lock:
+            try:
+                with open(self._path, "a", encoding="utf-8") as f:
+                    f.write(f"[{timestamp()}] {line}\n")
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +167,11 @@ class TCPClient:
 # ---------------------------------------------------------------------------
 
 class UDPSocket:
-    """Manages a UDP socket for send (broadcast) and receive."""
+    """Manages a UDP socket for send (broadcast) and receive.
+
+    The socket binds to a single receive port, but can send to any IP:port
+    via send_to().
+    """
 
     def __init__(self, on_data=None, on_status=None):
         self.on_data = on_data
@@ -140,20 +180,16 @@ class UDPSocket:
         self._thread = None
         self._running = False
         self.bound = False
-        self._send_ip = None
-        self._send_port = None
 
-    def connect(self, ip, port):
-        """Bind to the given port for receiving and store target ip/port for sending."""
+    def connect(self, recv_port):
+        """Bind to recv_port for listening."""
         if self.bound:
             return
         try:
-            self._send_ip = ip
-            self._send_port = int(port)
             self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._socket.bind(("", self._send_port))
+            self._socket.bind(("", int(recv_port)))
             self._running = True
             self.bound = True
             if self.on_status:
@@ -178,13 +214,13 @@ class UDPSocket:
         if self.on_status:
             self.on_status(False)
 
-    def send(self, data_str):
-        """Send a UDP datagram to the configured target."""
-        if not self.bound or not self._socket:
+    def send_to(self, data_str, ip, port):
+        """Send a UDP datagram to a specific ip:port."""
+        if not self._socket:
             return
         raw = data_str.encode('latin-1')
         try:
-            self._socket.sendto(raw, (self._send_ip, self._send_port))
+            self._socket.sendto(raw, (ip, int(port)))
         except Exception:
             pass
 
@@ -210,18 +246,19 @@ class MappingEngine:
     """Holds the list of mappings and performs lookups."""
 
     def __init__(self):
-        self.mappings = []  # list of dicts: {direction, tcp_value, udp_value}
+        self.mappings = []
+        # Each mapping: {direction, tcp_value, udp_value, udp_send_ip, udp_send_port}
 
     def process_tcp(self, msg):
-        """Return list of UDP values to send for a received TCP message."""
+        """Return list of (udp_value, udp_send_ip, udp_send_port) for a received TCP message."""
         results = []
         for m in self.mappings:
             if m["direction"] == "TCP -> UDP" and m["tcp_value"] and msg == m["tcp_value"]:
-                results.append(m["udp_value"])
+                results.append((m["udp_value"], m.get("udp_send_ip", ""), m.get("udp_send_port", "")))
         return results
 
     def process_udp(self, msg):
-        """Return list of TCP values to send for a received UDP message."""
+        """Return list of tcp_value strings for a received UDP message."""
         results = []
         for m in self.mappings:
             if m["direction"] == "UDP -> TCP" and m["udp_value"] and msg == m["udp_value"]:
@@ -241,8 +278,10 @@ class BridgeApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("TCP / UDP Protocol Bridge")
-        self.geometry("960x720")
-        self.minsize(800, 600)
+        self.geometry("1060x760")
+        self.minsize(900, 650)
+
+        self.file_logger = FileLogger()
 
         self.tcp_client = TCPClient(
             on_data=lambda m: self.after(0, self._on_tcp_data, m),
@@ -263,6 +302,9 @@ class BridgeApp(tk.Tk):
         self._flush_logs()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Auto-connect after GUI is up (small delay so window renders first)
+        self.after(500, self._auto_connect)
 
     # ---- GUI construction --------------------------------------------------
 
@@ -288,22 +330,19 @@ class BridgeApp(tk.Tk):
         self.tcp_status_lbl = tk.Label(tcp_lf, text="Disconnected", fg="red")
         self.tcp_status_lbl.grid(row=0, column=6, padx=6)
 
-        # UDP
-        udp_lf = tk.LabelFrame(conn_frame, text="UDP Connection", padx=6, pady=4)
+        # UDP Receive
+        udp_lf = tk.LabelFrame(conn_frame, text="UDP Receive", padx=6, pady=4)
         udp_lf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
 
-        tk.Label(udp_lf, text="IP:").grid(row=0, column=0, sticky=tk.E)
-        self.udp_ip_var = tk.StringVar()
-        tk.Entry(udp_lf, textvariable=self.udp_ip_var, width=18).grid(row=0, column=1, padx=2)
-        tk.Label(udp_lf, text="Port:").grid(row=0, column=2, sticky=tk.E)
-        self.udp_port_var = tk.StringVar()
-        tk.Entry(udp_lf, textvariable=self.udp_port_var, width=8).grid(row=0, column=3, padx=2)
+        tk.Label(udp_lf, text="Listen Port:").grid(row=0, column=0, sticky=tk.E)
+        self.udp_recv_port_var = tk.StringVar()
+        tk.Entry(udp_lf, textvariable=self.udp_recv_port_var, width=8).grid(row=0, column=1, padx=2)
         self.udp_conn_btn = tk.Button(udp_lf, text="Connect", command=self._udp_connect)
-        self.udp_conn_btn.grid(row=0, column=4, padx=4)
+        self.udp_conn_btn.grid(row=0, column=2, padx=4)
         self.udp_disc_btn = tk.Button(udp_lf, text="Disconnect", state=tk.DISABLED, command=self._udp_disconnect)
-        self.udp_disc_btn.grid(row=0, column=5, padx=2)
+        self.udp_disc_btn.grid(row=0, column=3, padx=2)
         self.udp_status_lbl = tk.Label(udp_lf, text="Disconnected", fg="red")
-        self.udp_status_lbl.grid(row=0, column=6, padx=6)
+        self.udp_status_lbl.grid(row=0, column=4, padx=6)
 
         # ---------- Log area ----------
         log_frame = tk.Frame(self)
@@ -311,12 +350,14 @@ class BridgeApp(tk.Tk):
 
         tcp_log_lf = tk.LabelFrame(log_frame, text="TCP Data Log")
         tcp_log_lf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
-        self.tcp_log = scrolledtext.ScrolledText(tcp_log_lf, state=tk.DISABLED, height=10, wrap=tk.WORD, font=("Consolas", 9))
+        self.tcp_log = scrolledtext.ScrolledText(tcp_log_lf, state=tk.DISABLED, height=10,
+                                                  wrap=tk.WORD, font=("Consolas", 9))
         self.tcp_log.pack(fill=tk.BOTH, expand=True)
 
         udp_log_lf = tk.LabelFrame(log_frame, text="UDP Data Log")
         udp_log_lf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
-        self.udp_log = scrolledtext.ScrolledText(udp_log_lf, state=tk.DISABLED, height=10, wrap=tk.WORD, font=("Consolas", 9))
+        self.udp_log = scrolledtext.ScrolledText(udp_log_lf, state=tk.DISABLED, height=10,
+                                                  wrap=tk.WORD, font=("Consolas", 9))
         self.udp_log.pack(fill=tk.BOTH, expand=True)
 
         # ---------- Mapping area ----------
@@ -326,16 +367,19 @@ class BridgeApp(tk.Tk):
         # Header row
         hdr = tk.Frame(map_outer)
         hdr.pack(fill=tk.X)
-        tk.Label(hdr, text="Direction", width=14, anchor=tk.W, font=("", 9, "bold")).pack(side=tk.LEFT, padx=2)
-        tk.Label(hdr, text="TCP Value", width=30, anchor=tk.W, font=("", 9, "bold")).pack(side=tk.LEFT, padx=2)
-        tk.Label(hdr, text="UDP Value", width=30, anchor=tk.W, font=("", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        tk.Label(hdr, text="Direction", width=12, anchor=tk.W, font=("", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        tk.Label(hdr, text="TCP Value", width=26, anchor=tk.W, font=("", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        tk.Label(hdr, text="UDP Value", width=26, anchor=tk.W, font=("", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        tk.Label(hdr, text="UDP Send IP", width=16, anchor=tk.W, font=("", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        tk.Label(hdr, text="UDP Send Port", width=12, anchor=tk.W, font=("", 9, "bold")).pack(side=tk.LEFT, padx=2)
         tk.Button(hdr, text="+ Add Row", command=self._add_mapping_row).pack(side=tk.RIGHT, padx=4)
 
         # Scrollable mapping rows
         self._map_canvas = tk.Canvas(map_outer, highlightthickness=0)
         self._map_scrollbar = ttk.Scrollbar(map_outer, orient=tk.VERTICAL, command=self._map_canvas.yview)
         self._map_inner = tk.Frame(self._map_canvas)
-        self._map_inner.bind("<Configure>", lambda e: self._map_canvas.configure(scrollregion=self._map_canvas.bbox("all")))
+        self._map_inner.bind("<Configure>",
+                             lambda e: self._map_canvas.configure(scrollregion=self._map_canvas.bbox("all")))
         self._map_canvas.create_window((0, 0), window=self._map_inner, anchor=tk.NW)
         self._map_canvas.configure(yscrollcommand=self._map_scrollbar.set)
 
@@ -343,42 +387,59 @@ class BridgeApp(tk.Tk):
         self._map_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Enable mousewheel scrolling
-        self._map_canvas.bind("<Enter>", lambda e: self._map_canvas.bind_all("<MouseWheel>", self._on_map_mousewheel))
-        self._map_canvas.bind("<Leave>", lambda e: self._map_canvas.unbind_all("<MouseWheel>"))
+        self._map_canvas.bind("<Enter>",
+                              lambda e: self._map_canvas.bind_all("<MouseWheel>", self._on_map_mousewheel))
+        self._map_canvas.bind("<Leave>",
+                              lambda e: self._map_canvas.unbind_all("<MouseWheel>"))
 
         self.mapping_rows = []  # list of dicts with widgets
 
         # ---------- Status bar ----------
         self.status_var = tk.StringVar(value="Ready")
-        tk.Label(self, textvariable=self.status_var, anchor=tk.W, relief=tk.SUNKEN, padx=6).pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Label(self, textvariable=self.status_var, anchor=tk.W, relief=tk.SUNKEN,
+                 padx=6).pack(fill=tk.X, side=tk.BOTTOM)
 
     def _on_map_mousewheel(self, event):
         self._map_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     # ---- Mapping rows ------------------------------------------------------
 
-    def _add_mapping_row(self, direction="TCP -> UDP", tcp_val="", udp_val=""):
+    def _add_mapping_row(self, direction="TCP -> UDP", tcp_val="", udp_val="",
+                         udp_send_ip="", udp_send_port=""):
         row_frame = tk.Frame(self._map_inner)
         row_frame.pack(fill=tk.X, pady=1)
 
         dir_var = tk.StringVar(value=direction)
-        dir_cb = ttk.Combobox(row_frame, textvariable=dir_var, values=["TCP -> UDP", "UDP -> TCP"],
+        dir_cb = ttk.Combobox(row_frame, textvariable=dir_var,
+                              values=["TCP -> UDP", "UDP -> TCP"],
                               state="readonly", width=12)
         dir_cb.pack(side=tk.LEFT, padx=2)
 
         tcp_var = tk.StringVar(value=tcp_val)
-        tcp_entry = tk.Entry(row_frame, textvariable=tcp_var, width=32)
+        tcp_entry = tk.Entry(row_frame, textvariable=tcp_var, width=28)
         tcp_entry.pack(side=tk.LEFT, padx=2)
 
         udp_var = tk.StringVar(value=udp_val)
-        udp_entry = tk.Entry(row_frame, textvariable=udp_var, width=32)
+        udp_entry = tk.Entry(row_frame, textvariable=udp_var, width=28)
         udp_entry.pack(side=tk.LEFT, padx=2)
+
+        send_ip_var = tk.StringVar(value=udp_send_ip)
+        send_ip_entry = tk.Entry(row_frame, textvariable=send_ip_var, width=16)
+        send_ip_entry.pack(side=tk.LEFT, padx=2)
+
+        send_port_var = tk.StringVar(value=udp_send_port)
+        send_port_entry = tk.Entry(row_frame, textvariable=send_port_var, width=8)
+        send_port_entry.pack(side=tk.LEFT, padx=2)
 
         row_data = {
             "frame": row_frame,
             "dir_var": dir_var,
             "tcp_var": tcp_var,
             "udp_var": udp_var,
+            "send_ip_var": send_ip_var,
+            "send_port_var": send_port_var,
+            "send_ip_entry": send_ip_entry,
+            "send_port_entry": send_port_entry,
         }
 
         del_btn = tk.Button(row_frame, text="X", fg="red", width=3,
@@ -387,14 +448,26 @@ class BridgeApp(tk.Tk):
 
         self.mapping_rows.append(row_data)
 
+        # Toggle send-port fields based on direction
+        self._update_row_send_fields(row_data)
+        dir_cb.bind("<<ComboboxSelected>>", lambda e, rd=row_data: (
+            self._update_row_send_fields(rd), self._sync_and_save()))
+
         # Auto-save on changes
-        dir_cb.bind("<<ComboboxSelected>>", lambda e: self._sync_and_save())
-        tcp_entry.bind("<FocusOut>", lambda e: self._sync_and_save())
-        udp_entry.bind("<FocusOut>", lambda e: self._sync_and_save())
-        tcp_entry.bind("<Return>", lambda e: self._sync_and_save())
-        udp_entry.bind("<Return>", lambda e: self._sync_and_save())
+        for entry in (tcp_entry, udp_entry, send_ip_entry, send_port_entry):
+            entry.bind("<FocusOut>", lambda e: self._sync_and_save())
+            entry.bind("<Return>", lambda e: self._sync_and_save())
 
         self._sync_and_save()
+
+    def _update_row_send_fields(self, row_data):
+        """Enable UDP Send IP/Port only when direction is TCP -> UDP."""
+        if row_data["dir_var"].get() == "TCP -> UDP":
+            row_data["send_ip_entry"].config(state=tk.NORMAL)
+            row_data["send_port_entry"].config(state=tk.NORMAL)
+        else:
+            row_data["send_ip_entry"].config(state=tk.DISABLED)
+            row_data["send_port_entry"].config(state=tk.DISABLED)
 
     def _del_mapping_row(self, row_data):
         row_data["frame"].destroy()
@@ -409,6 +482,8 @@ class BridgeApp(tk.Tk):
                 "direction": r["dir_var"].get(),
                 "tcp_value": r["tcp_var"].get(),
                 "udp_value": r["udp_var"].get(),
+                "udp_send_ip": r["send_ip_var"].get(),
+                "udp_send_port": r["send_port_var"].get(),
             })
         self._save_config()
 
@@ -422,25 +497,49 @@ class BridgeApp(tk.Tk):
             return
         try:
             self.tcp_client.connect(ip, port)
+            self._log_tcp(f"Connected to {ip}:{port}")
         except ConnectionError as e:
+            self._log_tcp(f"Connect failed: {e}")
             messagebox.showerror("TCP", str(e))
 
     def _tcp_disconnect(self):
         self.tcp_client.disconnect()
+        self._log_tcp("Disconnected")
 
     def _udp_connect(self):
-        ip = self.udp_ip_var.get().strip()
-        port = self.udp_port_var.get().strip()
-        if not ip or not port:
-            messagebox.showwarning("UDP", "Enter IP and Port.")
+        port = self.udp_recv_port_var.get().strip()
+        if not port:
+            messagebox.showwarning("UDP", "Enter a listen port.")
             return
         try:
-            self.udp_socket.connect(ip, port)
+            self.udp_socket.connect(port)
+            self._log_udp(f"Listening on port {port}")
         except ConnectionError as e:
+            self._log_udp(f"Bind failed: {e}")
             messagebox.showerror("UDP", str(e))
 
     def _udp_disconnect(self):
         self.udp_socket.disconnect()
+        self._log_udp("Disconnected")
+
+    def _auto_connect(self):
+        """Attempt to connect TCP and UDP using saved config values."""
+        tcp_ip = self.tcp_ip_var.get().strip()
+        tcp_port = self.tcp_port_var.get().strip()
+        if tcp_ip and tcp_port:
+            try:
+                self.tcp_client.connect(tcp_ip, tcp_port)
+                self._log_tcp(f"Auto-connected to {tcp_ip}:{tcp_port}")
+            except ConnectionError as e:
+                self._log_tcp(f"Auto-connect failed: {e}")
+
+        udp_port = self.udp_recv_port_var.get().strip()
+        if udp_port:
+            try:
+                self.udp_socket.connect(udp_port)
+                self._log_udp(f"Auto-listening on port {udp_port}")
+            except ConnectionError as e:
+                self._log_udp(f"Auto-bind failed: {e}")
 
     # ---- Status callbacks --------------------------------------------------
 
@@ -457,7 +556,7 @@ class BridgeApp(tk.Tk):
 
     def _on_udp_status(self, bound):
         if bound:
-            self.udp_status_lbl.config(text="Connected", fg="green")
+            self.udp_status_lbl.config(text="Listening", fg="green")
             self.udp_conn_btn.config(state=tk.DISABLED)
             self.udp_disc_btn.config(state=tk.NORMAL)
         else:
@@ -468,28 +567,43 @@ class BridgeApp(tk.Tk):
 
     def _update_status_bar(self):
         tcp_s = "Connected" if self.tcp_client.connected else "Disconnected"
-        udp_s = "Bound" if self.udp_socket.bound else "Disconnected"
+        udp_s = "Listening" if self.udp_socket.bound else "Disconnected"
         self.status_var.set(f"TCP: {tcp_s}  |  UDP: {udp_s}")
+
+    # ---- Logging helpers (timestamp + file) --------------------------------
+
+    def _log_tcp(self, line):
+        stamped = f"[{timestamp()}] {line}"
+        self._tcp_log_q.append(stamped)
+        self.file_logger.write(f"TCP  | {line}")
+
+    def _log_udp(self, line):
+        stamped = f"[{timestamp()}] {line}"
+        self._udp_log_q.append(stamped)
+        self.file_logger.write(f"UDP  | {line}")
 
     # ---- Data handlers -----------------------------------------------------
 
     def _on_tcp_data(self, msg):
-        self._tcp_log_q.append(f"RX: {msg}")
+        self._log_tcp(f"RX: {msg}")
         # Run through mapping engine
-        udp_values = self.engine.process_tcp(msg)
-        for uv in udp_values:
-            self.udp_socket.send(uv)
-            self._udp_log_q.append(f"TX: {uv}")
-            self._tcp_log_q.append(f"  -> mapped to UDP: {uv}")
+        udp_targets = self.engine.process_tcp(msg)
+        for udp_value, send_ip, send_port in udp_targets:
+            if send_ip and send_port:
+                self.udp_socket.send_to(udp_value, send_ip, send_port)
+                self._log_udp(f"TX -> {send_ip}:{send_port}: {udp_value}")
+                self._log_tcp(f"  -> mapped to UDP ({send_ip}:{send_port}): {udp_value}")
+            else:
+                self._log_tcp(f"  -> mapping matched but no UDP send IP/port configured")
 
     def _on_udp_data(self, msg):
-        self._udp_log_q.append(f"RX: {msg}")
+        self._log_udp(f"RX: {msg}")
         # Run through mapping engine
         tcp_values = self.engine.process_udp(msg)
         for tv in tcp_values:
             self.tcp_client.send(tv)
-            self._tcp_log_q.append(f"TX: {tv}")
-            self._udp_log_q.append(f"  -> mapped to TCP: {tv}")
+            self._log_tcp(f"TX: {tv}")
+            self._log_udp(f"  -> mapped to TCP: {tv}")
 
     # ---- Log flushing (throttled) ------------------------------------------
 
@@ -518,8 +632,7 @@ class BridgeApp(tk.Tk):
         cfg = {
             "tcp_ip": self.tcp_ip_var.get(),
             "tcp_port": self.tcp_port_var.get(),
-            "udp_ip": self.udp_ip_var.get(),
-            "udp_port": self.udp_port_var.get(),
+            "udp_recv_port": self.udp_recv_port_var.get(),
             "mappings": self.engine.mappings,
         }
         try:
@@ -537,13 +650,14 @@ class BridgeApp(tk.Tk):
                 cfg = json.load(f)
             self.tcp_ip_var.set(cfg.get("tcp_ip", ""))
             self.tcp_port_var.set(cfg.get("tcp_port", ""))
-            self.udp_ip_var.set(cfg.get("udp_ip", ""))
-            self.udp_port_var.set(cfg.get("udp_port", ""))
+            self.udp_recv_port_var.set(cfg.get("udp_recv_port", cfg.get("udp_port", "")))
             for m in cfg.get("mappings", []):
                 self._add_mapping_row(
                     direction=m.get("direction", "TCP -> UDP"),
                     tcp_val=m.get("tcp_value", ""),
                     udp_val=m.get("udp_value", ""),
+                    udp_send_ip=m.get("udp_send_ip", m.get("udp_ip", "")),
+                    udp_send_port=m.get("udp_send_port", ""),
                 )
         except Exception:
             pass
@@ -552,6 +666,7 @@ class BridgeApp(tk.Tk):
 
     def _on_close(self):
         self._save_config()
+        self.file_logger.write("========== Session ended ==========")
         self.tcp_client.disconnect()
         self.udp_socket.disconnect()
         self.destroy()
